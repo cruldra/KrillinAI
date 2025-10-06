@@ -187,7 +187,7 @@ func LoadConfig() bool {
 	}
 }
 
-// 验证配置
+// CheckConfig 验证配置
 func CheckConfig() error {
 	var err error
 	// 解析代理地址

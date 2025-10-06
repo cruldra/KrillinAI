@@ -1297,44 +1297,111 @@ func (s Service) splitLongSentence(item *TranslatedItem) ([]*TranslatedItem, err
 	return splitItems, nil
 }
 
+// splitOriginLongSentence 使用大语言模型（LLM）将长句子分割成多个短句子
+//
+// 功能说明：
+// 该函数用于在翻译前对原始语言的长句子进行智能分割，以便：
+// 1. 提高字幕的可读性（避免单行字幕过长）
+// 2. 提升翻译质量（短句更容易准确翻译）
+// 3. 优化字幕显示效果（适配不同屏幕尺寸）
+//
+// 分割策略：
+// - 句子长度 ≤ 200字符：使用标准分割提示词（SplitOriginLongSentencePrompt）
+//   要求：分割成最多3个部分，优先2个部分
+// - 句子长度 > 200字符：使用语义分割提示词（SplitLongTextByMeaningPrompt）
+//   要求：根据语义尽可能多地分割，每个部分尽量短
+//
+// 重试机制：
+// - 最多尝试3次LLM调用
+// - 每次失败后会记录错误日志并继续重试
+// - 如果3次都失败，返回错误
+//
+// 参数：
+//   - sentence: 需要分割的原始句子（字符串）
+//
+// 返回值：
+//   - []string: 分割后的短句子数组
+//   - error: 如果所有重试都失败，返回错误；否则返回nil
+//
+// 示例：
+//   输入: "This is a very long sentence that needs to be split into multiple parts for better readability."
+//   输出: ["This is a very long sentence", "that needs to be split into multiple parts", "for better readability."]
+//
+// 注意事项：
+// 1. LLM返回的JSON格式必须符合：{"short_sentences":[{"text":"句子1"},{"text":"句子2"}]}
+// 2. 分割后的句子必须与原文完全一致，不能修改任何单词
+// 3. 如果LLM返回的响应包含Markdown代码块标记（```json），会自动清理
+// 4. 该函数通常在 splitSentenceRecursively 中被调用，用于递归分割超长句子
 func (s Service) splitOriginLongSentence(sentence string) ([]string, error) {
+	// 根据句子长度选择不同的分割策略
+	// 短句（≤200字符）：使用标准分割，分成2-3部分
+	// 长句（>200字符）：使用语义分割，尽可能多地分割
 	prompt := fmt.Sprintf(types.SplitOriginLongSentencePrompt, sentence)
 	if len(sentence) > 200 {
 		prompt = fmt.Sprintf(types.SplitLongTextByMeaningPrompt, sentence)
 	}
 
-	var response string
-	var err error
-	shortSentences := make([]string, 0)
-	// 尝试调用3次
+	var response string      // LLM返回的原始响应
+	var err error            // 错误信息
+	shortSentences := make([]string, 0) // 存储分割后的短句子
+
+	// 重试机制：最多尝试3次LLM调用
+	// 原因：LLM可能因为网络问题、API限流或返回格式错误而失败
 	for i := range 3 {
+		// 调用LLM进行句子分割
 		response, err = s.ChatCompleter.ChatCompletion(prompt)
 		if err != nil {
-			log.GetLogger().Error("splitOriginLongSentence chat completion error", zap.Error(err), zap.String("sentence", sentence), zap.Any("time", i))
-			continue
+			// 记录LLM调用失败的错误日志
+			log.GetLogger().Error("splitOriginLongSentence chat completion error",
+				zap.Error(err),
+				zap.String("sentence", sentence),
+				zap.Any("time", i))
+			continue // 继续下一次重试
 		}
+
+		// 定义JSON响应的数据结构
+		// 期望的JSON格式：
+		// {
+		//   "short_sentences": [
+		//     {"text": "分割后的句子1"},
+		//     {"text": "分割后的句子2"}
+		//   ]
+		// }
 		var splitResult struct {
 			ShortSentences []struct {
-				Text string `json:"text"`
-			} `json:"short_sentences"`
+				Text string `json:"text"` // 分割后的单个句子
+			} `json:"short_sentences"` // 短句子数组
 		}
 
+		// 清理LLM响应中的Markdown代码块标记
+		// 例如：```json\n{...}\n``` -> {...}
 		cleanResponse := util.CleanMarkdownCodeBlock(response)
+
+		// 解析JSON响应
 		if err = json.Unmarshal([]byte(cleanResponse), &splitResult); err != nil {
-			log.GetLogger().Error("splitOriginLongSentence parse split result error", zap.Error(err), zap.Any("response", response))
-			continue
+			// 记录JSON解析失败的错误日志
+			// 这是日志中常见的错误："unexpected end of JSON input"
+			log.GetLogger().Error("splitOriginLongSentence parse split result error",
+				zap.Error(err),
+				zap.Any("response", response))
+			continue // 继续下一次重试
 		}
 
+		// 提取分割后的句子文本
 		for _, shortSentence := range splitResult.ShortSentences {
 			shortSentences = append(shortSentences, shortSentence.Text)
 		}
+
+		// 成功解析，跳出重试循环
 		break
 	}
 
+	// 如果3次重试都失败，返回错误
 	if err != nil {
 		return nil, fmt.Errorf("parse split result error: %w", err)
 	}
 
+	// 返回分割后的短句子数组
 	return shortSentences, nil
 }
 

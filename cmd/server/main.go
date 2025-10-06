@@ -1,12 +1,13 @@
 package main
 
 import (
-	"go.uber.org/zap"
 	"krillin-ai/config"
 	"krillin-ai/internal/deps"
 	"krillin-ai/internal/server"
 	"krillin-ai/log"
 	"os"
+
+	"go.uber.org/zap"
 )
 
 func main() {

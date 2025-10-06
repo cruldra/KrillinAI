@@ -1,66 +1,108 @@
 package openai
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	openai "github.com/sashabaranov/go-openai"
-	"go.uber.org/zap"
 	"io"
 	"krillin-ai/config"
 	"krillin-ai/log"
 	"net/http"
 	"os"
 	"strings"
+
+	"go.uber.org/zap"
 )
 
 func (c *Client) ChatCompletion(query string) (string, error) {
-	var responseFormat *openai.ChatCompletionResponseFormat
+	baseUrl := config.Conf.Llm.BaseUrl
+	if baseUrl == "" {
+		baseUrl = "https://api.openai.com/v1"
+	}
+	url := baseUrl + "/chat/completions"
 
-	req := openai.ChatCompletionRequest{
-		Model: config.Conf.Llm.Model,
-		Messages: []openai.ChatCompletionMessage{
+	requestBody := map[string]interface{}{
+		"model": config.Conf.Llm.Model,
+		"messages": []map[string]string{
 			{
-				Role:    openai.ChatMessageRoleSystem,
-				Content: "You are an assistant that helps with subtitle translation.",
+				"role":    "system",
+				"content": "You are an assistant that helps with subtitle translation.",
 			},
 			{
-				Role:    openai.ChatMessageRoleUser,
-				Content: query,
+				"role":    "user",
+				"content": query,
 			},
 		},
-		Temperature:    0.9,
-		Stream:         true,
-		MaxTokens:      8192,
-		ResponseFormat: responseFormat,
+		"temperature": 0.9,
+		"max_tokens":  4096,
 	}
 
-	stream, err := c.client.CreateChatCompletionStream(context.Background(), req)
+	jsonData, err := json.Marshal(requestBody)
 	if err != nil {
-		log.GetLogger().Error("openai create chat completion stream failed", zap.Error(err))
 		return "", err
 	}
-	defer stream.Close()
 
-	var resContent string
-	for {
-		response, err := stream.Recv()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			log.GetLogger().Error("openai stream receive failed", zap.Error(err))
-			return "", err
-		}
-		if len(response.Choices) == 0 {
-			log.GetLogger().Info("openai stream receive no choices", zap.Any("response", response))
-			continue
-		}
+	curlCmd := fmt.Sprintf("curl -X POST '%s' \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer %s' \\\n  -d '%s'",
+		url,
+		config.Conf.Llm.ApiKey,
+		string(jsonData))
+	log.GetLogger().Info("curl command", zap.String("curl", curlCmd))
 
-		resContent += response.Choices[0].Delta.Content
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(jsonData)))
+	if err != nil {
+		return "", err
 	}
 
-	return resContent, nil
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", config.Conf.Llm.ApiKey))
+
+	client := &http.Client{}
+	if config.Conf.App.Proxy != "" {
+		transport := &http.Transport{
+			Proxy: http.ProxyURL(config.Conf.App.ParsedProxy),
+		}
+		client.Transport = transport
+		log.GetLogger().Info("using proxy", zap.String("proxy", config.Conf.App.Proxy))
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.GetLogger().Error("http request failed", zap.Error(err))
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	log.GetLogger().Info("response status", zap.Int("status_code", resp.StatusCode))
+	log.GetLogger().Info("response body", zap.String("body", string(body)))
+
+	if resp.StatusCode != http.StatusOK {
+		log.GetLogger().Error("non-200 status code", zap.Int("status_code", resp.StatusCode), zap.String("body", string(body)))
+		return "", fmt.Errorf("non-200 status code: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		return "", err
+	}
+
+	if len(result.Choices) == 0 {
+		log.GetLogger().Error("no choices in response")
+		return "", fmt.Errorf("no choices in response")
+	}
+
+	return result.Choices[0].Message.Content, nil
 }
 
 func (c *Client) Text2Speech(text, voice string, outputFile string) error {
